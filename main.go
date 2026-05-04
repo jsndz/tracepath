@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -12,8 +13,19 @@ import (
 )
 
 func main() {
+	var (
+		maxHops = flag.Int("h", 30, "max hops")
+		timeout = flag.Int("t", 2, "timeout in seconds")
+		probes  = flag.Int("p", 3, "probes per hop")
+	)
+	flag.Parse()
+	if flag.NArg() < 1 {
+		fmt.Println("usage: traceroute [options] <host>")
+		flag.PrintDefaults()
+		return
+	}
 
-	dns := os.Args[1]
+	dns := flag.Arg(0)
 
 	ips, err := net.LookupIP(dns)
 	if err != nil {
@@ -31,14 +43,13 @@ func main() {
 
 	var b [4]byte
 	copy(b[:], ip)
-	// copy needs slice as arg
-	// so convert b to slice using [:]
-	//[:] is a slice operator
-	// When applied to an array, it creates a slice that references the array’s underlying memory.
-	for i := 0; i < 30; i++ {
+	MAXHOPS := *maxHops
+	TIMEOUT := *timeout
+	PROBES := *probes
+	for i := 0; i < MAXHOPS; i++ {
 		unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_TTL, i+1)
 		unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO,
-			&unix.Timeval{Sec: 2})
+			&unix.Timeval{Sec: int32(TIMEOUT), Usec: 0})
 		msg := icmp.Message{
 			Type: ipv4.ICMPTypeEcho,
 			Code: 0,
@@ -53,39 +64,43 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		start := time.Now()
-		unix.Sendto(fd, packet, 0, &unix.SockaddrInet4{Addr: b})
+		done := false
+		fmt.Printf("%2d  ", i+1)
+		for try := 0; try < PROBES; try++ {
+			start := time.Now()
+			unix.Sendto(fd, packet, 0, &unix.SockaddrInet4{Addr: b})
 
-		buf := make([]byte, 1500)
+			buf := make([]byte, 1500)
 
-		n, from, err := unix.Recvfrom(fd, buf, 0)
-		if err != nil {
-			panic(err)
-		}
+			n, from, err := unix.Recvfrom(fd, buf, 0)
+			if err != nil {
+				panic(err)
+			}
 
-		ip := net.IP(from.(*unix.SockaddrInet4).Addr[:]).String()
-		rtt := time.Since(start)
-		// header length of 4 bytes, so multiply by 4 to get the actual header length in bytes
-		ihl := int(buf[0]&0x0f) * 4
-		//if total lenght is less than header length invalid
-		if n < ihl {
-			continue
+			ip := net.IP(from.(*unix.SockaddrInet4).Addr[:]).String()
+			rtt := time.Since(start)
+			ihl := int(buf[0]&0x0f) * 4
+			if n < ihl {
+				continue
+			}
+			reply, err := icmp.ParseMessage(1, buf[ihl:n])
+			if err != nil {
+				fmt.Printf("* ")
+				continue
+			}
+
+			fmt.Printf("%s %v ", ip, rtt)
+
+			if reply.Type == ipv4.ICMPTypeEchoReply {
+				done = true
+				break
+			}
 		}
-		// parse icmp messsage
-		reply, err := icmp.ParseMessage(1, buf[ihl:n])
-		if err != nil {
-			continue
-		}
-		// if echo message
-		switch body := reply.Body.(type) {
-		case *icmp.Echo:
-			fmt.Println("from", ip, "message:", string(body.Data), "rtt:", rtt, "hop:", i+1)
-		default:
-			fmt.Println("from", ip, "type:", reply.Type, "rtt:", rtt, "hop:", i+1)
-		}
-		// if you get echo reply,  reached the destination and can stop
-		if reply.Type == ipv4.ICMPTypeEchoReply {
+		fmt.Println()
+
+		if done {
 			break
 		}
+
 	}
 }
